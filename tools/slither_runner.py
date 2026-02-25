@@ -4,8 +4,12 @@ import shutil
 import subprocess
 import re
 from pathlib import Path
+from tools.tool_executor import ToolExecutor
 
 class SlitherRunner: 
+
+  def __init__(self):
+    self.tool_executor = ToolExecutor()
 
   def run_slither_repo(self, path, output_path="output.json"): 
     cmd = ["slither", path, "--json", output_path]
@@ -25,7 +29,7 @@ class SlitherRunner:
       report_path.unlink()
 
     # check==False because Slither can return non-zero when detectors find issues even if JSON output succeeded.
-    result = subprocess.run(cmd, check=False)
+    result = self.tool_executor.run(cmd, False)
 
     if result.returncode == 0:
       return
@@ -83,7 +87,7 @@ class SlitherRunner:
       install_env["VIRTUAL_ENV"] = str(local_venv)
       install_env["PATH"] = f"{local_venv / 'bin'}:{install_env.get('PATH', '')}"
 
-    subprocess.run([solc_select, "install", version], check=True, env=install_env)
+    self.tool_executor.run([solc_select, "install", version], check=True, env=install_env)
 
     for artifacts_dir in self._solc_artifacts_dirs():
       binary_path = artifacts_dir / relative_binary_path
