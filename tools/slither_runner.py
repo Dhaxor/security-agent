@@ -5,55 +5,59 @@ import subprocess
 import re
 from pathlib import Path
 from tools.tool_executor import ToolExecutor
+from tools.slither_parser import SlitherParser
 
 class SlitherRunner: 
 
   def __init__(self):
     self.tool_executor = ToolExecutor()
+    self.slither_parser = SlitherParser()
 
-  def run_slither_repo(self, path, output_path="output.json"): 
-    cmd = ["slither", path, "--json", output_path]
+  # runs slither on a repo
+  def run_slither_repo(self, path, output_path="parsed_output.json"): 
+    cmd = ["slither", path, "--json", "-"]
     return self._run_slither(cmd, output_path)    
 
-  def run_slither_file(self, path, output_path="output.json", solidity_version=None):
+  # runs slither on a file
+  def run_slither_file(self, path, output_path="parsed_output.json", solidity_version=None):
     version = solidity_version or self._extract_solidity_version(path)
     solc_path = self._resolve_solc(version)
-    cmd = ["slither", path, "--solc", solc_path, "--json", output_path]
+    cmd = ["slither", path, "--solc", solc_path, "--json", "-"]
 
     return self._run_slither(cmd, output_path)
 
-
+  # runs slither
   def _run_slither(self, cmd, output_path):
-    report_path = Path(output_path)
-    if report_path.exists():
-      report_path.unlink()
-
     # check==False because Slither can return non-zero when detectors find issues even if JSON output succeeded.
     result = self.tool_executor.run(cmd, False)
+    try:
+      report = json.loads(result.stdout)
+    except (TypeError, ValueError) as error:
+      raise RuntimeError(
+        f"Failed to parse Slither JSON output from stdout. stderr: {result.stderr!r}"
+      ) from error
 
-    if result.returncode == 0:
-      return
+    normalized = self.slither_parser.parse_report(report, output_path)
+    if result.returncode == 0 or report.get("success") is True:
+      return normalized
 
-    # Slither can return non-zero when detectors find issues even if JSON output succeeded.
-    if report_path.exists():
-      try:
-        report = json.loads(report_path.read_text())
-        if report.get("success") is True:
-          return
-      except (OSError, ValueError):
-        pass
+    raise subprocess.CalledProcessError(
+      result.returncode,
+      cmd,
+      output=result.stdout,
+      stderr=result.stderr,
+    )
 
-    raise subprocess.CalledProcessError(result.returncode, cmd)        
-
+  # returns the .solc-select directory for virtual environment and global
   def _solc_artifacts_dirs(self) -> list[Path]:
     dirs = []
     venv = os.environ.get("VIRTUAL_ENV")
     if venv:
-      dirs.append(Path(venv) / ".solc-select" / "artifacts")
+      dirs.append(Path(venv) / ".solc-select" / "artifacts") # virtual environment
 
     local_venv = Path.cwd() / ".venv"
-    dirs.append(local_venv / ".solc-select" / "artifacts")
-    dirs.append(Path.home() / ".solc-select" / "artifacts")
+    dirs.append(local_venv / ".solc-select" / "artifacts") # local environment
+    dirs.append(Path.home() / ".solc-select" / "artifacts") # global
 
     # Preserve order while de-duplicating.
     unique_dirs = []
@@ -62,6 +66,8 @@ class SlitherRunner:
         unique_dirs.append(directory)
     return unique_dirs
 
+  # returns file path for solidity_version compiler
+  # first finds it, and if it is not available, it installs it.
   def _resolve_solc(self, solidity_version: str) -> str:
     match = re.search(r"(\d+\.\d+\.\d+)", solidity_version)
     if not match:
@@ -99,6 +105,7 @@ class SlitherRunner:
       f"solc {version} was not installed by solc-select. Checked: {checked_dirs}"
     )
 
+  # extracts solidity version from solidity file
   def _extract_solidity_version(self, path: str) -> str:
     source = Path(path).read_text()
     match = re.search(r"pragma\s+solidity\s+([^;]+);", source)
