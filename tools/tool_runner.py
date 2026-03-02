@@ -1,4 +1,4 @@
-from tools.slither_runner import SlitherRunner
+from tools.slither.slither_runner import SlitherRunner
 
 class ToolRunner:
 

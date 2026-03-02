@@ -1,6 +1,6 @@
 [
   {
-    "id": "64674a91-650b-4500-a7c3-ee57b7a4d50e",
+    "id": "47ebd0fc-8aa3-439f-b81f-952e244b463f",
     "tool": "slither",
     "check_type": "suicidal",
     "severity": "high",
@@ -76,11 +76,11 @@
       "impact": "High",
       "confidence": "High"
     },
-    "invariant_category": "access-control",
+    "invariant_category": "",
     "verified": false
   },
   {
-    "id": "e3283de0-e9f4-44f3-9b7b-eb3856e1cbcc",
+    "id": "698f99ee-6bf4-4754-9055-bd4a8b5a05d9",
     "tool": "slither",
     "check_type": "solc-version",
     "severity": "informational",
@@ -103,11 +103,11 @@
       "impact": "Informational",
       "confidence": "High"
     },
-    "invariant_category": "uncategorized",
+    "invariant_category": "",
     "verified": false
   },
   {
-    "id": "36c4922c-4548-42f1-9a9d-ac2171121abb",
+    "id": "c98d900e-e3fe-403a-9346-08e0186212f1",
     "tool": "slither",
     "check_type": "solc-version",
     "severity": "informational",
@@ -155,7 +155,7 @@
       "impact": "Informational",
       "confidence": "High"
     },
-    "invariant_category": "uncategorized",
+    "invariant_category": "",
     "verified": false
   }
 ]

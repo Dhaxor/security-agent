@@ -5,7 +5,7 @@ import subprocess
 import re
 from pathlib import Path
 from tools.tool_executor import ToolExecutor
-from tools.slither_parser import SlitherParser
+from tools.slither.slither_parser import SlitherParser
 
 class SlitherRunner: 
 
