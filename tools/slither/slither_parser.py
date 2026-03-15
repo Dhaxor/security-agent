@@ -56,7 +56,6 @@ class SlitherParser:
       "function": function_name,
       "location": location,
       "description": detector.get("description", "").strip(),
-      "raw_tool_output": detector,  # Store full original detector result
       "invariant_category": "",     # Placeholder, not parsed here
       "verified": False,            # Default value (not verified)
     }

@@ -8,3 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Environment variables
+.env
+
+# Audit outputs (generated)
+parsed_output.json
+slither_findings.json
+audit_report.md
+slither_output_tmp.json
