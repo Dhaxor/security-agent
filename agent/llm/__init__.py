@@ -1,10 +1,11 @@
 from agent.llm.base import LLMClient, FilterResult, ExploitTestResult, BugReportEntry
-from agent.llm.anthropic_litellm import AnthropicLiteLLMClient
+from agent.llm.llm_client import LiteLLMClient, AnthropicLiteLLMClient
 
 __all__ = [
     "LLMClient",
     "FilterResult",
     "ExploitTestResult",
     "BugReportEntry",
+    "LiteLLMClient",
     "AnthropicLiteLLMClient",
 ]

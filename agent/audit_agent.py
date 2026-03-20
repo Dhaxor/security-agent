@@ -1,11 +1,18 @@
 """
-Orchestrates the Solidity audit: Slither → tool-augmented LLM (filter + verify: write test, pass, fix, fail, revert, delete) → report.
+Orchestrates the Solidity audit: Slither → tool-augmented LLM (filter + verify) → report.
+
+Enhanced with intelligent context management:
+- Semantic graph for dependency analysis
+- Call graph for cross-contract tracing
+- Git context for regression detection
+- Token-optimized context assembly
 """
 
 import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +22,10 @@ from tools.foundry.foundry_runner import FoundryRunner
 from agent.llm.base import LLMClient, FilterResult, ExploitTestResult, BugReportEntry
 from agent.report import report_to_markdown
 from agent.filter_agent import run_filter_agent
+from context.context_manager import ContextManager, ContextConfig
+
+if TYPE_CHECKING:
+    from agent.cli_output import CliOutput
 
 
 @dataclass
@@ -22,16 +33,15 @@ class AuditConfig:
     """Configuration for a single audit run."""
 
     repo_path: Path
-    """Foundry project root (directory containing foundry.toml or src/)."""
     target_file: Path | None = None
-    """If set, run Slither only on this file; otherwise run on the whole repo."""
     slither_output_path: str = "slither_findings.json"
     report_output_path: str = "audit_report.md"
     execution_env: ExecutionEnvironment | None = None
     llm_client: LLMClient | None = None
     llm_model: str = "claude-sonnet-4-20250514"
     llm_api_key: str | None = None
-    filter_model: str | None = None  # If set, use this (e.g. cheaper) model for the filter agent only.
+    filter_model: str | None = None
+    context_config: ContextConfig | None = None
 
 
 @dataclass
@@ -48,9 +58,9 @@ class AuditResult:
 
 
 class AuditAgent:
-    def __init__(self, config: AuditConfig):
+    def __init__(self, config: AuditConfig, cli: "CliOutput | None" = None):
         from tools.execution.local import LocalExecutionEnvironment
-        from agent.llm.anthropic_litellm import AnthropicLiteLLMClient
+        from agent.llm.llm_client import AnthropicLiteLLMClient
 
         self.config = config
         self.executor = config.execution_env or LocalExecutionEnvironment()
@@ -59,102 +69,204 @@ class AuditAgent:
         self.foundry_runner = FoundryRunner(executor=self.executor)
         self.repo_path = Path(config.repo_path).resolve()
         self.report_entries: list[BugReportEntry] = []
+        self.cli = cli
 
-    def _gather_repo_context(self, max_chars_per_file: int = 15000) -> str:
-        """Build a string of relevant Solidity source for LLM context."""
-        parts = []
-        src = self.repo_path / "src"
-        if not src.exists():
-            src = self.repo_path
-        for path in sorted(src.rglob("*.sol")):
-            if self.config.target_file and path.resolve() != Path(self.config.target_file).resolve():
-                continue
-            try:
-                content = path.read_text()
-                if len(content) > max_chars_per_file:
-                    content = content[:max_chars_per_file] + "\n// ... truncated"
-                parts.append(f"=== {path.relative_to(self.repo_path)} ===\n{content}")
-            except Exception as e:
-                parts.append(f"=== {path} (read error: {e}) ===\n")
-        return "\n\n".join(parts) if parts else "No Solidity files found."
+        context_config = config.context_config or ContextConfig()
+        self.context_manager = ContextManager(self.repo_path, context_config)
 
     def run(self) -> AuditResult:
         result = AuditResult()
         cwd = self.repo_path
+        cli = self.cli
 
-        # 1) Run Slither
-        logger.info("Stage 1/3: Running Slither...")
+        # ── Stage 1: Index Repository ──────────────────────────────
+        if cli:
+            cli.stage(1, 4, "Indexing Repository")
+
+        try:
+            # Show what we're scanning
+            sol_files = list(cwd.rglob("*.sol"))
+            skip_dirs = {"node_modules", ".git", "lib", "cache", "out", "artifacts"}
+            sol_files = [
+                f for f in sol_files
+                if not any(skip in f.parts for skip in skip_dirs)
+            ]
+            if cli:
+                cli.info(f"Scanning {len(sol_files)} Solidity files")
+
+            with cli.spinner("Building semantic graph...") if cli else nullcontext():
+                self.context_manager.index()
+
+            stats = self.context_manager.get_stats()
+            sg = stats["semantic_graph"]
+            cg = stats.get("call_graph") or {}
+            git = stats.get("git") or {}
+
+            if cli:
+                cli.success(f"Indexed {sg['contracts']} contracts from {sg['files_indexed']} files")
+                with cli.indent():
+                    cli.info(f"{sg['functions']} functions, {sg['edges']} dependency edges")
+                    if cg:
+                        cli.info(f"Call graph: {cg['total_edges']} calls ({cg['external_calls']} external)")
+                    if git.get("available"):
+                        cli.info(f"Git: {git.get('total_commits', '?')} commits, {git.get('contributors', '?')} contributors")
+
+                # List contracts found
+                if self.context_manager.semantic_graph.contracts:
+                    cli.info("Contracts found:")
+                    with cli.indent():
+                        for name, contract in sorted(self.context_manager.semantic_graph.contracts.items()):
+                            func_count = len(contract.functions)
+                            cli.info(f"{name} ({contract.contract_type}) — {func_count} functions")
+
+        except Exception as e:
+            if cli:
+                cli.warning(f"Context indexing failed: {e}")
+
+        # ── Stage 2: Run Slither ───────────────────────────────────
+        print()
+        if cli:
+            cli.stage(2, 4, "Running Slither Static Analysis")
+
         try:
             if self.config.target_file:
                 target = Path(self.config.target_file).resolve()
-                logger.info("  Target: %s", target.name)
+                if cli:
+                    cli.info(f"Target: {target.name}")
                 findings = self.slither_runner.run_slither_file(
                     target,
                     output_path=str(cwd / self.config.slither_output_path),
                     cwd=cwd,
                 )
             else:
-                logger.info("  Target: repository %s", cwd)
-                findings = self.slither_runner.run_slither_repo(
-                    cwd,
-                    output_path=str(cwd / self.config.slither_output_path),
-                    cwd=cwd,
-                )
+                with cli.spinner("Running Slither analysis...") if cli else nullcontext():
+                    findings = self.slither_runner.run_slither_repo(
+                        cwd,
+                        output_path=str(cwd / self.config.slither_output_path),
+                        cwd=cwd,
+                    )
         except Exception as e:
-            result.errors.append(f"Slither run failed: {e}")
-            logger.exception("Slither failed")
+            result.errors.append(f"Slither failed: {e}")
+            if cli:
+                cli.error(f"Slither failed: {e}")
             return result
 
         result.findings_raw = findings
-        logger.info("  Slither found %d issue(s).", len(findings))
+        if cli:
+            cli.success(f"Found {len(findings)} issues")
+            # Show breakdown by severity
+            severity_counts = {}
+            for f in findings:
+                sev = f.get("severity", "unknown").lower()
+                severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            with cli.indent():
+                for sev in ["critical", "high", "medium", "low", "informational", "optimization"]:
+                    if sev in severity_counts:
+                        color = cli._severity_color(sev)
+                        cli.info(f"{color}{sev.upper()}\033[0m: {severity_counts[sev]}")
+
         if not findings:
-            logger.info("No findings; audit complete.")
+            if cli:
+                cli.info("No findings to analyze")
             return result
 
-        logger.info("Stage 2/3: Filtering and verifying findings (tool-augmented agent: ripgrep, shell, Foundry, read/write file)...")
+        # ── Stage 3: Build Context ─────────────────────────────────
+        print()
+        if cli:
+            cli.stage(3, 4, "Building Context")
+
+        finding_contexts = {}
         try:
-            filter_model = getattr(self.config, "filter_model", None) or getattr(self.config, "llm_model", "claude-sonnet-4-20250514")
+            with cli.spinner("Analyzing dependencies and call paths...") if cli else nullcontext():
+                finding_contexts = self.context_manager.build_context_for_findings(findings)
+            if cli:
+                cli.success(f"Built context for {len(finding_contexts)} findings")
+        except Exception as e:
+            if cli:
+                cli.warning(f"Context building failed: {e}")
+
+        # ── Stage 4: LLM Verification ──────────────────────────────
+        print()
+        if cli:
+            cli.stage(4, 4, "LLM Verification")
+
+        try:
+            filter_model = (
+                getattr(self.config, "filter_model", None)
+                or getattr(self.config, "llm_model", "claude-sonnet-4-20250514")
+            )
+            if cli:
+                cli.info(f"Using model: {filter_model}")
+
             filter_results = run_filter_agent(
                 findings=findings,
                 repo_path=cwd,
                 foundry_runner=self.foundry_runner,
                 model=filter_model,
                 api_key=getattr(self.config, "llm_api_key", None),
+                finding_contexts=finding_contexts,
+                context_manager=self.context_manager,
+                cli=cli,
             )
         except Exception as e:
             result.errors.append(f"Filter agent failed: {e}")
-            logger.exception("Filter agent failed")
+            if cli:
+                cli.error(f"Filter agent failed: {e}")
             return result
 
         result.filter_results = filter_results
         finding_by_id = {f["id"]: f for f in findings}
         true_ids = [r.finding_id for r in filter_results if r.is_true_positive]
-        result.true_positive_findings = [finding_by_id[i] for i in true_ids if i in finding_by_id]
-        logger.info("  %d true positive(s) (exploitable), %d false positive(s).", len(result.true_positive_findings), len(findings) - len(result.true_positive_findings))
+        result.true_positive_findings = [
+            finding_by_id[i] for i in true_ids if i in finding_by_id
+        ]
 
-        # Build report entries from filter results (agent already verified: write test, pass, fix, fail, revert, delete)
-        for r in filter_results:
-            if not r.is_true_positive:
-                continue
-            finding = finding_by_id.get(r.finding_id)
-            if not finding:
-                continue
-            try:
-                entry = self.llm.generate_report_entry(finding, r.exploit_scenario or "Exploit verified by agent.")
-                result.report_entries.append(entry)
-            except Exception as e:
-                result.errors.append(f"Report entry for {r.finding_id}: {e}")
-                logger.warning("    Report entry failed: %s", e)
+        tp_count = len(result.true_positive_findings)
+        fp_count = len(findings) - tp_count
+        if cli:
+            cli.success(f"Verified {tp_count} true positives, {fp_count} false positives")
 
-        # 3) Write markdown report
-        logger.info("Stage 3/3: Writing report...")
+        # Build report entries
+        if cli and result.true_positive_findings:
+            cli.info("Confirmed vulnerabilities:")
+            with cli.indent():
+                for finding in result.true_positive_findings:
+                    try:
+                        entry = self.llm.generate_report_entry(
+                            finding, 
+                            next(
+                                (r.exploit_scenario for r in filter_results 
+                                 if r.finding_id == finding["id"]),
+                                "Exploit verified by agent."
+                            )
+                        )
+                        result.report_entries.append(entry)
+                        cli.finding(
+                            0,
+                            finding.get("check_type", ""),
+                            finding.get("severity", ""),
+                            finding.get("contract", ""),
+                            finding.get("function", ""),
+                        )
+                    except Exception as e:
+                        result.errors.append(f"Report entry for {finding.get('id')}: {e}")
+
+        # Write report
         if result.report_entries:
             report_path = cwd / self.config.report_output_path
             report_to_markdown(result.report_entries, report_path)
             result.report_markdown_path = report_path
-            logger.info("  Report written to %s", report_path)
-        else:
-            logger.info("  No report entries to write.")
 
-        logger.info("Audit complete.")
         return result
+
+    @staticmethod
+    def _reset():
+        return "\033[0m"
+
+
+class nullcontext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass

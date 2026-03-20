@@ -22,9 +22,13 @@ from agent.llm.base import (
 
 
 def _model_id(model: str) -> str:
-    """Normalize to litellm model string (e.g. anthropic/claude-3-5-sonnet)."""
-    if model.startswith("anthropic/"):
+    """Normalize to litellm model string (e.g. anthropic/claude-3-5-sonnet, openai/gpt-4o)."""
+    # Already prefixed (anthropic/, openai/, etc.)
+    if "/" in model:
         return model
+    # Infer provider from model name
+    if model.startswith("gpt-") or model.startswith("o1") or model.startswith("o3"):
+        return f"openai/{model}"
     return f"anthropic/{model}"
 
 
@@ -60,7 +64,9 @@ def _extract_fenced_code(raw: str, lang: str = "solidity") -> str:
     return ""
 
 
-class AnthropicLiteLLMClient(LLMClient):
+class LiteLLMClient(LLMClient):
+    """LLM client that supports multiple providers via litellm (Anthropic, OpenAI, etc.)."""
+
     def __init__(
         self,
         model: str = "claude-sonnet-4-20250514",
@@ -68,7 +74,11 @@ class AnthropicLiteLLMClient(LLMClient):
     ):
         self.model = _model_id(model)
         if api_key:
-            litellm.anthropic_key = api_key
+            # Set key based on provider
+            if self.model.startswith("openai/"):
+                litellm.openai_key = api_key
+            else:
+                litellm.anthropic_key = api_key
 
     def _complete(
         self,
@@ -184,18 +194,31 @@ Do not put the Solidity code inside the JSON. Put the JSON first, then the code 
         finding: dict,
         exploit_scenario: str,
     ) -> BugReportEntry:
-        system = """You are a Solidity security auditor writing a report. For the given finding and its exploit scenario, produce a structured report entry in JSON:
+        # Apply severity overrides to fix Slither's severity inflation
+        severity_overrides = {
+            "reentrancy-unlimited-gas": "medium",
+            "calls-loop": "medium",
+            "locked-ether": "medium",
+            "timestamp": "low",
+            "missing-zero-check": "low",
+        }
+        check_type = (finding.get("check_type") or "").strip()
+        original_severity = finding.get("severity", "Unknown")
+        if check_type in severity_overrides:
+            original_severity = severity_overrides[check_type]
 
-{
-  "severity": "Critical|High|Medium|Low|Informational",
+        system = f"""You are a Solidity security auditor writing a report. For the given finding and its exploit scenario, produce a structured report entry in JSON:
+
+{{
+  "severity": "{original_severity}",  // USE THIS EXACT SEVERITY - do not change it
   "type": "<check type from finding>",
   "difficulty": "Low|Medium|High",
   "description": "<clear 1-3 sentence description of the vulnerability>",
   "exploit_scenario": "<same or refined exploit scenario>",
   "recommendations": "<concrete fix recommendations, bullet points OK>"
-}
+}}
 
-Use the finding's severity if appropriate; set difficulty based on how hard the bug is to exploit."""
+IMPORTANT: Use the severity "{original_severity}" exactly as provided. Do not change it."""
 
         user = f"Finding:\n{json.dumps(finding, indent=2)}\n\nExploit scenario:\n{exploit_scenario}"
         raw = self._complete(system, user, response_format={"type": "json_object"})
@@ -217,3 +240,7 @@ Use the finding's severity if appropriate; set difficulty based on how hard the 
             exploit_scenario=_str_field(data.get("exploit_scenario"), exploit_scenario),
             recommendations=_str_field(data.get("recommendations"), ""),
         )
+
+
+# Backward compatibility alias
+AnthropicLiteLLMClient = LiteLLMClient
